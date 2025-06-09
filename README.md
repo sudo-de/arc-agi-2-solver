@@ -1,6 +1,6 @@
 # ARC-AGI-2 Solver
 
-[![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Python Version](https://img.shields.io/badge/python-3.13+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![pytest](https://github.com/sudo-de/arc-agi-2-solver/actions/workflows/pytest.yml/badge.svg)](https://github.com/sudo-de/arc-agi-2-solver/actions)
 
