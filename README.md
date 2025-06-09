@@ -2,9 +2,9 @@
 
 [![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![pytest](https://github.com/your-username/arc-agi-2-solver/actions/workflows/pytest.yml/badge.svg)](https://github.com/your-username/arc-agi-2-solver/actions)
+[![pytest](https://github.com/sudo-de/arc-agi-2-solver/actions/workflows/pytest.yml/badge.svg)](https://github.com/sudo-de/arc-agi-2-solver/actions)
 
-A Python-based solver for the **[Abstraction and Reasoning Challenge (ARC-AGI-2)](https://www.kaggle.com/competitions/arc-agi-2)**, designed to tackle grid-based pattern recognition tasks using a variational autoencoder (VAE) approach. This project implements a modular, robust, and extensible framework for processing, training, and visualizing ARC tasks, with a focus on achieving high performance in the Kaggle competition.
+A Python-based solver for the **[Abstraction and Reasoning Challenge (ARC-AGI-2)](https://www.kaggle.com/competitions/arc-prize-2025)**, designed to tackle grid-based pattern recognition tasks using a variational autoencoder (VAE) approach. This project implements a modular, robust, and extensible framework for processing, training, and visualizing ARC tasks, with a focus on achieving high performance in the Kaggle competition.
 
 ## Features
 
