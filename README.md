@@ -51,16 +51,16 @@ A Python-based solver for the **[Abstraction and Reasoning Challenge (ARC-AGI-2)
     │   ├── arc_visualizer.py      # Visualization of tasks and solutions
     │   ├── arc_trainer.py         # Training logic
     ├── tests/
-    │   ├── conftest.py            # Pytest fixtures
+    │   ├── conftest.py           # Pytest fixtures
     │   ├── test_*.py             # Test modules
-        │   ├── data/
-        │   │   └── sample_task.json  # Sample ARC task
-    ├── data/                     # Place ARC task files here
-    ├── plots/                    # Output directory for visualizations
-    ├── requirements.txt          # Python dependencies
-    ├── pytest.ini               # Pytest configuration
-    ├── LICENSE                  # License file
-    ├── README.md                # This file
+    │       ├── data/
+    │             └── sample_task.json  # Sample ARC task
+    ├── data/               # Place ARC task files here
+    ├── plots/              # Output directory for visualizations
+    ├── requirements.txt    # Python dependencies
+    ├── pytest.ini          # Pytest configuration
+    ├── LICENSE             # License file
+    ├── README.md           # This file
 
 ## Contributing
 Contributions are welcome! To contribute:
