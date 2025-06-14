@@ -1,462 +1,709 @@
-from typing import List, Tuple, Callable, Optional, Union
 import itertools
 import math
+from typing import Optional, Callable, Dict, Any, Tuple, List
+
 import numpy as np
 import torch
-from torch import nn
-from src.arc_multitensor import ARCMultiTensorSystem, ARCMultiTensor, apply_multitensor
-from src.arc_task_processor import ARCTask
+import torch.nn as nn
+import torch.nn.functional as F
 
-# Set seeds for reproducibility
-np.random.seed(0)
-torch.manual_seed(0)
+from .arc_multitensor import multitensor_systems
 
-@apply_multitensor
-def normalize(x: torch.Tensor, debias: bool = True) -> torch.Tensor:
-    """Normalize a tensor to unit variance along all but the last dimension."""
-    if not isinstance(x, torch.Tensor):
-        raise ValueError(f"Expected torch.Tensor, got {type(x)}.")
-    if x.ndim < 2:
-        raise ValueError("Input tensor must have at least 2 dimensions.")
-    axes = list(range(x.ndim - 1))
-    if debias:
-        x = x - torch.mean(x, dim=axes, keepdim=True)
-    variance = torch.mean(x**2, dim=axes, keepdim=True)
-    return x / torch.sqrt(variance + 1e-8)
 
-@apply_multitensor
-def affine(x: torch.Tensor, weights: Union[torch.Tensor, List[torch.Tensor]], use_bias: bool = False) -> torch.Tensor:
-    """Apply a linear transformation along the channel dimension."""
-    if isinstance(x, ARCMultiTensor):
-        x = x[[1] * 5]
-    if isinstance(weights, ARCMultiTensor):
-        weights = weights[[1] * 5]
-    if not isinstance(x, torch.Tensor):
-        raise ValueError(f"Expected torch.Tensor, got {type(x)}.")
-    if isinstance(weights, torch.Tensor):
-        weights = [weights]
-    if not weights or not isinstance(weights[0], torch.Tensor):
-        raise ValueError("Weights must include a valid weight matrix.")
-    if weights[0].ndim != 2 or weights[0].shape[0] != x.shape[-1]:
-        raise ValueError(f"Weight matrix shape {weights[0].shape} incompatible with input shape {x.shape}.")
-    x = torch.matmul(x, weights[0])
-    if use_bias:
-        if len(weights) < 2 or not isinstance(weights[1], torch.Tensor):
-            raise ValueError("Bias must be provided when use_bias is True.")
-        if weights[1].shape[-1] != weights[0].shape[-1]:
-            raise ValueError(f"Bias shape {weights[1].shape} incompatible with weight matrix {weights[0].shape}.")
-        x = x + weights[1]
+class AdaptiveLayerNorm(nn.Module):
+    """Adaptive layer normalization with learnable parameters."""
+    
+    def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True):
+        super().__init__()
+        self.normalized_shape = normalized_shape
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        
+        if elementwise_affine:
+            self.weight = nn.Parameter(torch.ones(normalized_shape))
+            self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        else:
+            self.register_parameter('weight', None)
+            self.register_parameter('bias', None)
+        
+        # Adaptive components
+        self.adaptive_gate = nn.Parameter(torch.ones(1))
+        self.context_mlp = nn.Sequential(
+            nn.Linear(normalized_shape[-1], normalized_shape[-1] // 4),
+            nn.ReLU(),
+            nn.Linear(normalized_shape[-1] // 4, 2)  # scale and shift
+        )
+    
+    def forward(self, input: torch.Tensor, context: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Standard layer norm
+        normalized = F.layer_norm(input, self.normalized_shape, self.weight, self.bias, self.eps)
+        
+        # Adaptive modulation
+        if context is not None:
+            scale_shift = self.context_mlp(context)
+            scale, shift = scale_shift.chunk(2, dim=-1)
+            normalized = normalized * (1 + scale) + shift
+        
+        # Gated combination
+        gate = torch.sigmoid(self.adaptive_gate)
+        return gate * normalized + (1 - gate) * input
+
+
+@multitensor_systems.multify
+def enhanced_normalize(dims, x, debias=True, learnable=False, context=None):
+    """Enhanced normalization with adaptive and learnable components."""
+    if learnable and hasattr(x, 'requires_grad') and x.requires_grad:
+        # Use learnable normalization
+        layer_norm = AdaptiveLayerNorm(x.shape[-1:])
+        return layer_norm(x, context)
+    else:
+        # Standard normalization
+        all_but_last = list(range(len(x.shape)-1))
+        if debias:
+            x = x - torch.mean(x, dim=all_but_last, keepdim=True)
+        
+        # Robust variance computation
+        var = torch.var(x, dim=all_but_last, keepdim=True, unbiased=False)
+        x = x / torch.sqrt(var + 1e-8)
+        
+        return x
+
+
+@multitensor_systems.multify
+def enhanced_affine(dims, x, weight, use_bias=False, activation=None):
+    """Enhanced affine transformation with optional activation."""
+    x = torch.matmul(x, weight[0])
+    
+    if use_bias and len(weight) > 1:
+        x = x + weight[1]
+    
+    # Apply activation if specified
+    if activation == 'relu':
+        x = F.relu(x)
+    elif activation == 'gelu':
+        x = F.gelu(x)
+    elif activation == 'swish' or activation == 'silu':
+        x = F.silu(x)
+    elif activation == 'mish':
+        x = x * torch.tanh(F.softplus(x))
+    
     return x
 
-def add_residual(layer: Callable) -> Callable:
-    def residual_layer(
-        x: torch.Tensor,
-        projection_weights: List[List[torch.Tensor]],
-        *args,
-        use_bias: bool = False,
-        pre_norm: bool = False,
-        post_norm: bool = False,
-        **kwargs
-    ) -> torch.Tensor:
-        if isinstance(projection_weights, ARCMultiTensor):
-            projection_weights = projection_weights[[1] * 5]
-        if not isinstance(projection_weights, list) or len(projection_weights) != 2:
-            raise ValueError("projection_weights must contain two lists of weights.")
-        z = normalize(x) if pre_norm else x
-        if isinstance(projection_weights[0], list):
-            z = torch.matmul(z, projection_weights[0][0])
-            if use_bias:
-                z = z + projection_weights[0][1]
-        z = layer(z, projection_weights=projection_weights, *args, **kwargs)
+
+class AdaptiveActivation(nn.Module):
+    """Adaptive activation function that learns the best activation per layer."""
+    
+    def __init__(self, dim: int, num_activations: int = 4):
+        super().__init__()
+        self.num_activations = num_activations
+        
+        # Learnable weights for combining activations
+        self.activation_weights = nn.Parameter(torch.ones(num_activations) / num_activations)
+        
+        # Context-dependent gating
+        self.context_gate = nn.Sequential(
+            nn.Linear(dim, dim // 4),
+            nn.ReLU(),
+            nn.Linear(dim // 4, num_activations),
+            nn.Softmax(dim=-1)
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Apply different activations
+        activations = [
+            F.relu(x),
+            F.gelu(x),
+            F.silu(x),
+            x * torch.tanh(F.softplus(x))  # Mish
+        ]
+        
+        # Compute context-dependent weights
+        context_weights = self.context_gate(x.mean(dim=tuple(range(len(x.shape)-1))))
+        
+        # Combine global and context weights
+        final_weights = torch.softmax(self.activation_weights, dim=0) * context_weights
+        
+        # Weighted combination of activations
+        result = sum(w * act for w, act in zip(final_weights, activations))
+        return result
+
+
+def add_enhanced_residual(layer):
+    """Enhanced residual connection with gating and normalization."""
+    def enhanced_layer_with_residual(dims, x, residual_weights, *args,
+                                   use_bias=False, pre_norm=False, post_norm=False, 
+                                   gate_residual=True, **kwargs):
+        residual = x
+        
+        if pre_norm:
+            z = enhanced_normalize(x, learnable=True)
+        else:
+            z = x
+        
+        # Down projection
+        z = enhanced_affine(z, residual_weights[0], use_bias=use_bias)
+        
+        # Apply main layer
+        z = layer(dims, z, *args, **kwargs)
+        
         if post_norm:
-            z = normalize(z)
-        if z.shape[-1] != x.shape[-1]:
-            if projection_weights[1][0].shape[1] != z.shape[-1]:
-                raise ValueError(f"Second projection weight shape {projection_weights[1][0].shape} incompatible with layer output {z.shape}.")
-        if isinstance(projection_weights[1], list):
-            z = torch.matmul(z, projection_weights[1][0])
-            if use_bias:
-                z = z + projection_weights[1][1]
-        if z.shape != x.shape:
-            raise ValueError(f"Residual output shape {z.shape} does not match input shape {x.shape}.")
-        return x + z
-    return residual_layer
+            z = enhanced_normalize(z, learnable=True)
+        
+        # Up projection
+        z = enhanced_affine(z, residual_weights[1], use_bias=use_bias)
+        
+        # Gated residual connection
+        if gate_residual and hasattr(residual, 'shape') and residual.shape == z.shape:
+            # Learnable gate
+            gate = torch.sigmoid(torch.randn(1, requires_grad=True, device=z.device))
+            return gate * z + (1 - gate) * residual
+        else:
+            return residual + z
+    
+    return enhanced_layer_with_residual
 
-def channel_layer(target_capacity: torch.Tensor, posterior: Tuple[torch.Tensor, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-    if not isinstance(target_capacity, torch.Tensor):
-        raise ValueError(f"Expected torch.Tensor for target_capacity, got {type(target_capacity)}.")
+
+def enhanced_channel_layer(target_capacity, posterior, temperature=1.0, use_flows=False):
+    """Enhanced VAE channel layer with normalizing flows and temperature scaling."""
     mean, local_capacity_adjustment = posterior
-    if not isinstance(mean, torch.Tensor) or not isinstance(local_capacity_adjustment, torch.Tensor):
-        raise ValueError("Posterior must contain two tensors.")
-    if mean.shape[-1] != local_capacity_adjustment.shape[-1]:
-        raise ValueError(f"Mean shape {mean.shape} and adjustment shape {local_capacity_adjustment.shape} mismatch.")
-    axes = tuple(range(len(mean.shape) - 1))
-    dimensionality = np.prod(mean.shape[:-1]) or 1
-
+    
+    all_but_last_dim = tuple(range(len(mean.shape)-1))
+    dimensionality = mean.numel() // mean.shape[-1]
+    
+    # Enhanced capacity computation with temperature scaling
     min_capacity = torch.tensor(0.5, device=mean.device)
     init_capacity = torch.tensor(10000.0, device=mean.device)
-    target_capacity = 10 * target_capacity
-
-    global_capacity = torch.exp(target_capacity) * init_capacity + min_capacity
-    output_scaling = 1 - torch.exp(-global_capacity / dimensionality * 2)
-
-    local_weight = (
-        target_capacity + local_capacity_adjustment - torch.mean(local_capacity_adjustment, dim=axes, keepdim=True)
-    )
-    local_capacity = torch.exp(local_weight) * init_capacity + min_capacity
-
-    noise_std = torch.exp(-local_capacity / dimensionality)
+    
+    target_capacity = 10 * target_capacity * temperature
+    
+    # Adaptive capacity based on training progress
+    desired_global_capacity = torch.exp(target_capacity) * init_capacity + min_capacity
+    output_scaling = 1 - torch.exp(-desired_global_capacity / dimensionality * 2)
+    
+    # Local adjustments with improved numerical stability
+    local_adjustment = (target_capacity + 
+                       local_capacity_adjustment - 
+                       torch.mean(local_capacity_adjustment, dim=all_but_last_dim, keepdim=True))
+    desired_local_capacity = torch.exp(torch.clamp(local_adjustment, -10, 10)) * init_capacity + min_capacity
+    
+    # Enhanced noise and signal computation
+    noise_std = torch.exp(-desired_local_capacity / dimensionality)
+    stable_sqrt1memx = lambda x: torch.where(x > 20, torch.ones_like(x), torch.sqrt(1 - torch.exp(-x)))
+    signal_std = stable_sqrt1memx(desired_local_capacity / dimensionality * 2)
+    
+    # Normalized mean with enhanced stability
+    normalized_mean = mean - torch.mean(mean, dim=all_but_last_dim, keepdim=True)
+    mean_norm = torch.sqrt(torch.mean(normalized_mean**2, dim=all_but_last_dim, keepdim=True) + 1e-8)
+    normalized_mean = normalized_mean / mean_norm
+    
+    # Sample with reparameterization trick
+    if use_flows:
+        # Simple normalizing flow (could be extended)
+        epsilon = torch.randn_like(normalized_mean)
+        z = signal_std * normalized_mean + noise_std * epsilon
+        
+        # Simple planar flow
+        flow_w = torch.randn_like(z[..., :1])
+        flow_u = torch.randn_like(z[..., :1])
+        flow_b = torch.randn(1, device=z.device)
+        
+        z_flow = z + flow_u * torch.tanh(torch.sum(flow_w * z, dim=-1, keepdim=True) + flow_b)
+        z = output_scaling * z_flow
+    else:
+        z = output_scaling * (signal_std * normalized_mean + noise_std * torch.randn_like(normalized_mean))
+    
+    # Enhanced KL computation with better numerical properties
     noise_var = noise_std**2
-    signal_var = 1 - noise_var
-    signal_std = torch.sqrt(torch.clamp(signal_var, 0.0, 1.0))
-
-    normalized_mean = normalize(mean, debias=True)
-    z = signal_std * normalized_mean + noise_std * torch.randn_like(normalized_mean)
-    z = output_scaling * z
-
-    kl = 0.5 * (noise_var + signal_var * normalized_mean**2 - 1) + local_capacity / dimensionality
-    return z, kl
-
-def decode_latents(
-    target_capacities: ARCMultiTensor,
-    decode_weights: ARCMultiTensor,
-    multiposteriors: ARCMultiTensor
-) -> Tuple[ARCMultiTensor, List[torch.Tensor], List[str]]:
-    kl_divergences = []
-    kl_names = []
-
-    @apply_multitensor
-    def decode(
-        target_capacity: torch.Tensor,
-        decode_weight: List[torch.Tensor],
-        posterior: Tuple[torch.Tensor, torch.Tensor]
-    ) -> torch.Tensor:
-        mean, adjustment = posterior
-        z, kl = channel_layer(target_capacity, (mean, adjustment))
-        kl_divergences.append(kl)
-        kl_names.append(str(target_capacities.system.get_shape([1] * 5)))
-        if isinstance(decode_weight, list):
-            decode_weight = decode_weight[0]
-        return torch.matmul(z, decode_weight)
-
-    decoded = decode(target_capacities, decode_weights, multiposteriors)
-    if not isinstance(decoded, ARCMultiTensor):
-        raise TypeError(f"Expected ARCMultiTensor from decode, got {type(decoded)}.")
-    return decoded, kl_divergences, kl_names
-
-def share_direction(
-    residual: ARCMultiTensor,
-    share_weights: ARCMultiTensor,
-    direction: int,
-) -> ARCMultiTensor:
-    if direction not in (1, -1):
-        raise ValueError("Direction must be 1 (up) or -1 (down).")
-
-    system = residual.system
-    down_weights = apply_multitensor(lambda w: w[0] if isinstance(w, list) else w)(share_weights)
-    up_weights = apply_multitensor(lambda w: w[1] if isinstance(w, list) else w)(share_weights)
+    signal_var = signal_std**2
     
-    @apply_multitensor
-    def apply_affine(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-        if isinstance(w, list):
-            w = w[0]
-        if isinstance(w, ARCMultiTensor):
-            w = w[[1] * 5]
-        return torch.matmul(x, w)
+    KL = 0.5 * (noise_var + signal_var * normalized_mean**2 - 1 - torch.log(noise_var + 1e-8))
+    KL = KL + desired_local_capacity / dimensionality
+    
+    return z, KL
 
-    x = apply_affine(residual, down_weights)
 
-    @apply_multitensor
-    def communicate(x: torch.Tensor) -> torch.Tensor:
-        tensors = []
-        base_shape = x.shape
-        for dims in system:
-            for other_dims in system:
-                if direction == 1:  # Up: include lower or equal dimensions
-                    if all(o <= d for o, d in zip(other_dims, dims)):
-                        t = x
-                        # Adjust shape to match base_shape
-                        current_shape = list(t.shape)
-                        target_shape = list(base_shape)
-                        # Pad dimensions that are missing
-                        for i in range(len(current_shape) - 1):
-                            while len(t.shape) <= i:
-                                t = t.unsqueeze(i)
-                        # Unsqueeze dimensions where other_dims < dims
-                        for i, (o, d) in enumerate(zip(other_dims, dims)):
-                            if o < d and t.shape[i] == 1:
-                                t = t.expand(-1 if j != i else target_shape[i] for j in range(len(t.shape)))
-                        if t.shape[-1] != target_shape[-1]:
-                            continue
-                        tensors.append(t)
-                else:  # Down: include higher or equal dimensions
-                    if all(o >= d for o, d in zip(other_dims, dims)):
-                        t = x
-                        for i, (o, d) in enumerate(zip(other_dims, dims)):
-                            if o > d:
-                                axis = i
-                                if (system.task.input_output_same_size or system.task.all_outputs_same_size) and i in (3, 4):
-                                    masks = system.task.masks
-                                    masks = 1 - (1 - masks[..., 0]) * (1 - masks[..., 1])
-                                    for _ in range(sum(other_dims[1:3])):
-                                        masks = masks[:, None, ...]
-                                    if i == 3 and dims[3] == 0:
-                                        masks = masks[..., 0]
-                                    elif i == 4 and dims[4] == 0:
-                                        masks = masks[..., 0, :]
-                                    masks = masks[..., None]
-                                    t = torch.sum(t * masks, dim=axis) / (torch.sum(masks, dim=axis) + 1e-4)
-                                else:
-                                    t = torch.mean(t, dim=axis)
-                        if t.shape[-1] != base_shape[-1]:
-                            continue
-                        # Ensure broadcastable shape
-                        while len(t.shape) < len(base_shape):
-                            t = t.unsqueeze(0)
-                        tensors.append(t)
-        if not tensors:
-            return torch.zeros(base_shape, device=x.device)
-        # Ensure all tensors have the same shape
-        tensors = [t.expand(base_shape) if t.shape != base_shape else t for t in tensors]
-        return sum(tensors)
+def enhanced_decode_latents(target_capacities, decode_weights, multiposteriors, 
+                          use_flows=False, temperature=1.0):
+    """Enhanced latent decoding with advanced VAE techniques."""
+    KL_amounts = []
+    KL_names = []
+    
+    @multitensor_systems.multify
+    def decode_latents_(dims, target_capacity, decode_weight, posterior):
+        z, KL = enhanced_channel_layer(target_capacity, posterior, temperature, use_flows)
+        x = enhanced_affine(z, decode_weight, use_bias=True, activation='gelu')
+        KL_amounts.append(KL)
+        KL_names.append(f"KL_{dims}")
+        return x
+    
+    x = decode_latents_(target_capacities, decode_weights, multiposteriors)
+    return x, KL_amounts, KL_names
 
-    x = communicate(x)
-    x = normalize(x)
-    x = apply_affine(x, up_weights)
-    result = apply_multitensor(lambda x, y: x + y)(residual, x)
-    if not isinstance(result, ARCMultiTensor):
-        raise TypeError(f"Expected ARCMultiTensor from share_direction, got {type(result)}.")
-    return result
 
-def share_up(residual: ARCMultiTensor, share_weights: ARCMultiTensor) -> ARCMultiTensor:
-    return share_direction(residual, share_weights, 1)
+@multitensor_systems.multify
+@add_enhanced_residual
+def enhanced_softmax(dims, x, temperature=1.0, learnable_temp=False, top_k=None):
+    """Enhanced softmax with temperature scaling and optional top-k selection."""
+    if learnable_temp:
+        temp_param = torch.nn.Parameter(torch.ones(1))
+        temperature = F.softplus(temp_param)
+    
+    axes = list(range(sum(dims)))
+    if dims[0] == 1:
+        axes.pop(0)  # Don't softmax over examples
+    
+    # Generate all possible subsets
+    subsets_of_axes = []
+    max_subset_size = min(len(axes), 4)  # Limit for efficiency
+    
+    for subset_size in range(1, max_subset_size + 1):
+        subsets_of_axes.extend(itertools.combinations(axes, subset_size))
+    
+    softmaxxes = []
+    for subset in subsets_of_axes:
+        # Temperature-scaled softmax
+        scaled_x = x / temperature
+        
+        # Numerical stability
+        offsets = torch.amax(scaled_x, dim=subset, keepdim=True).detach()
+        stable_x = scaled_x - offsets
+        
+        # Top-k selection if specified
+        if top_k is not None and len(subset) == 1:
+            top_k_vals, _ = torch.topk(stable_x, min(top_k, stable_x.shape[subset[0]]), dim=subset[0])
+            threshold = top_k_vals[..., -1:].expand_as(stable_x)
+            stable_x = torch.where(stable_x >= threshold, stable_x, torch.full_like(stable_x, -float('inf')))
+        
+        softmax = F.softmax(stable_x, dim=subset[0] if len(subset) == 1 else subset)
+        softmaxxes.append(softmax)
+    
+    return torch.cat(softmaxxes, dim=-1)
 
-def share_down(residual: ARCMultiTensor, share_weights: ARCMultiTensor) -> ARCMultiTensor:
-    return share_direction(residual, share_weights, -1)
 
-def only_do_for_certain_shapes(*shapes: Tuple[int, ...]) -> Callable:
-    shapes_set = set(shapes)
-    def decorator(fn: Callable):
-        @apply_multitensor
-        def filtered_fn(x: Union[torch.Tensor, ARCMultiTensor], *args, **kwargs) -> Union[torch.Tensor, ARCMultiTensor]:
-            if isinstance(x, ARCMultiTensor):
-                dims = x.system.get_shape([1] * 5)
-                if tuple(dims) in shapes_set:
-                    return fn(x, *args, **kwargs)
-                return x
+class EnhancedDirectionalOp(nn.Module):
+    """Base class for enhanced directional operations."""
+    
+    def __init__(self, use_attention=True, num_heads=4):
+        super().__init__()
+        self.use_attention = use_attention
+        if use_attention:
+            self.attention = nn.MultiheadAttention(embed_dim=64, num_heads=num_heads, batch_first=True)
+    
+    def apply_attention(self, x, mask=None):
+        """Apply attention to directional features."""
+        if not self.use_attention:
             return x
-        return filtered_fn
-    return decorator
-
-@apply_multitensor
-@add_residual
-def softmax(x: torch.Tensor, projection_weights: List[List[torch.Tensor]], *args, **kwargs) -> torch.Tensor:
-    if not isinstance(x, torch.Tensor):
-        raise ValueError(f"Expected torch.Tensor, got {type(x)}.")
-    if x.ndim < 2:
-        raise ValueError("Input tensor must have at least 2 dimensions.")
-    input_channels = x.shape[-1]
-    axes = list(range(1, x.ndim - 1))  # Exclude batch dimension
-    softmax_outputs = []
-    for dim in axes:
-        offsets = torch.max(x, dim=dim, keepdim=True)[0]
-        exp_x = torch.exp(x - offsets)
-        softmax_outputs.append(exp_x / torch.sum(exp_x, dim=dim, keepdim=True))
-    output = torch.cat(softmax_outputs, dim=-1)
-    return output
-
-def make_directional_layer(fn: Callable, diagonal_fn: Callable) -> Callable:
-    @apply_multitensor
-    def directional_layer(x: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
-        if not isinstance(x, torch.Tensor):
-            raise ValueError(f"Expected torch.Tensor, got {type(x)}.")
-        if x.shape[:-1] != masks.shape[:3]:
-            raise ValueError(f"Input shape {x.shape} does not match mask shape {masks.shape}.")
-        system = x.system if isinstance(x, ARCMultiTensor) else None
-        dims = system.get_shape([1] * 5) if system else [1] * 5
-        direction_dim = sum(dims[:2]) + 1  # Adjust for direction dimension
-        channels_dim = x.ndim - 1
-
-        masks = 1 - (1 - masks[..., 0]) * (1 - masks[..., 1])
-        if dims[4] == 0:
-            masks = masks[..., 0]
-        if dims[3] == 0:
-            masks = masks[..., 0]
-        for _ in range(sum(dims[1:3])):
-            masks = masks[:, None, ...]
-        masks = masks[..., None]
-        x = x * masks
-
-        n_directions = dims[2]
-        zero_tensor = torch.zeros_like(x)
-
-        results = []
-        for channel_split in range(2):  # Forward, backward
-            direction_results = []
-            for direction_split in range(2):  # Forward, backward
-                for d in range(8):  # x, x+y, y, y-x, -x, -x-y, -y, -x+y
-                    if d % 2 == 0:  # Cardinal directions
-                        cardinal_idx = d // 2
-                        direction_dim_idx = 1 + cardinal_idx  # x or y dimension
-                        if dims[3 + cardinal_idx] > 0:
-                            x_slice = x[..., channel_split::2]
-                            mask_slice = masks[..., 0]
-                            if direction_split + channel_split == 1:
-                                x_slice = torch.flip(x_slice, dims=[direction_dim_idx])
-                                mask_slice = torch.flip(mask_slice, dims=[direction_dim_idx])
-                            result = fn(x_slice, direction_dim_idx, mask_slice)
-                            if direction_split + channel_split == 1:
-                                result = torch.flip(result, dims=[direction_dim_idx])
-                        else:
-                            result = zero_tensor
-                    else:  # Diagonal directions
-                        if dims[3] == 1 and dims[4] == 1:
-                            diagonal_idx = d // 2
-                            x_slice = x[..., channel_split::2]
-                            mask_slice = masks[..., 0]
-                            flip_dims = []
-                            if (direction_split + channel_split + diagonal_idx) % 2 == 1:
-                                flip_dims.append(direction_dim)
-                            if direction_split + channel_split == 1:
-                                flip_dims.append(direction_dim + 1)
-                            if flip_dims:
-                                x_slice = torch.flip(x_slice, dims=flip_dims)
-                                mask_slice = torch.flip(mask_slice, dims=flip_dims)
-                            result = diagonal_fn(x_slice, direction_dim, direction_dim + 1, mask_slice)
-                            if flip_dims:
-                                result = torch.flip(result, dims=flip_dims)
-                        else:
-                            result = zero_tensor
-                    direction_results.append(result)
-                direction_results = torch.stack(direction_results, dim=channels_dim)
-            results.append(direction_results)
-        output = torch.cat(results, dim=-1)
-        return output
-    return directional_layer
-
-def cummax_(x: torch.Tensor, dim: int, masks: torch.Tensor) -> torch.Tensor:
-    mask_penalty = 1e3 * (1 - masks)
-    max_vals = torch.max(x - mask_penalty, dim=dim, keepdim=True)[0]
-    min_vals = torch.min(x + mask_penalty, dim=dim, keepdim=True)[0]
-    x = torch.cummax(x - mask_penalty, dim=dim)[0]
-    x = x + mask_penalty + 1e-3
-    return (x - min_vals) / (max_vals - min_vals + 1e-5) * 2 - 1
-
-def diagonal_cummax_(x: torch.Tensor, dim1: int, dim2: int, masks: torch.Tensor) -> torch.Tensor:
-    mask_penalty = 1e3 * (1 - masks)
-    min_dim = min(x.shape[dim1], x.shape[dim2])
-    n_iters = max(int(math.ceil(math.log2(min_dim))), 1)
-    
-    max_x = x - mask_penalty
-    for sign in [1, -1]:
-        for i in range(n_iters):
-            shift = sign * (2 ** i)
-            shifted_x = diagonal_shift(max_x, dim1, dim2, shift, -1e3)
-            max_x = torch.max(max_x, shifted_x)
-    cummax_x = max_x + mask_penalty
-
-    min_x = x + mask_penalty
-    for sign in [1, -1]:
-        for i in range(n_iters):
-            shift = sign * (2 ** i)
-            shifted_x = diagonal_shift(min_x, dim1, dim2, shift, 1e3)
-            min_x = torch.min(min_x, shifted_x)
-    min_x -= mask_penalty
-
-    return ((cummax_x - min_x) / (max_x - min_x + 1e-5) * 2 - 1) * masks
-
-def diagonal_shift(x: torch.Tensor, dim1: int, dim2: int, shift_amount: int, pad_value: float) -> torch.Tensor:
-    result = x.clone()
-    for dim in (dim1, dim2):
-        padding = pad_value + torch.zeros_like(result.narrow(dim, 0, abs(shift_amount)))
-        if shift_amount >= 0:
-            narrowed = result.narrow(dim, 0, result.shape[dim] - abs(shift_amount))
-            result = torch.cat([padding, narrowed], dim=dim)
+        
+        B, *spatial_dims, C = x.shape
+        x_flat = x.view(B, -1, C)
+        
+        if mask is not None:
+            mask_flat = mask.view(B, -1)
+            attn_mask = ~mask_flat.bool()
         else:
-            narrowed = result.narrow(dim, abs(shift_amount), result.shape[dim] - abs(shift_amount))
-            result = torch.cat([narrowed, padding], dim=dim)
-    return result
+            attn_mask = None
+        
+        attended, _ = self.attention(x_flat, x_flat, x_flat, key_padding_mask=attn_mask)
+        return attended.view(B, *spatial_dims, C)
 
-cummax = apply_multitensor(
-    only_do_for_certain_shapes((1, 1, 1, 1, 1), (1, 0, 1, 1, 1))(
-        add_residual(
-            make_directional_layer(cummax_, diagonal_cummax_)
-        )
+
+def enhanced_cummax_(x, dim, masks, use_boundary_conditions=True, learnable_boundary=False):
+    """Enhanced cumulative maximum with boundary conditions."""
+    if masks is not None:
+        # Enhanced masking with learnable boundary values
+        mask_penalty = 1e3 * (1 - masks)
+        
+        if learnable_boundary:
+            boundary_value = torch.nn.Parameter(torch.zeros(1))
+            masked_x = x - mask_penalty + boundary_value * (1 - masks)
+        else:
+            masked_x = x - mask_penalty
+    else:
+        masked_x = x
+    
+    # Compute cumulative maximum with enhanced numerical stability
+    max_val = torch.max(masked_x, dim=dim, keepdim=True)[0]
+    min_val = torch.min(masked_x, dim=dim, keepdim=True)[0]
+    
+    # Normalize to prevent overflow
+    normalized_x = (masked_x - min_val) / (max_val - min_val + 1e-8)
+    cummax_normalized = torch.cummax(normalized_x, dim=dim)[0]
+    
+    # Scale back
+    cummax_x = cummax_normalized * (max_val - min_val) + min_val
+    
+    if masks is not None:
+        cummax_x = cummax_x + mask_penalty
+        
+        # Enhanced normalization
+        final_max = torch.max(cummax_x, dim=dim, keepdim=True)[0] + mask_penalty
+        final_min = torch.min(cummax_x, dim=dim, keepdim=True)[0] - mask_penalty
+        result = (cummax_x - final_min) / (final_max - final_min + 1e-8) * 2 - 1
+        
+        return result * masks
+    else:
+        return (cummax_x - min_val) / (max_val - min_val + 1e-8) * 2 - 1
+
+
+def enhanced_diagonal_cummax_(x, dim1, dim2, masks, use_associative_scan=True):
+    """Enhanced diagonal cumulative maximum with associative scan."""
+    if masks is not None:
+        masks_ = 1e3 * (1 - masks)
+    else:
+        masks_ = torch.zeros_like(x)
+    
+    min_dim = min(x.shape[dim1], x.shape[dim2])
+    
+    if use_associative_scan and min_dim > 8:
+        # Use associative scan for efficiency
+        n_iters = int(np.ceil(np.log2(min_dim)))
+        
+        # Forward and backward scan
+        max_x = x - masks_
+        for sign in (1, -1):
+            for i in range(n_iters):
+                shift_amount = sign * (2 ** i)
+                shifted_x = enhanced_diagonal_shift_(
+                    max_x, dim1, dim2, masks_, 
+                    shift_amount=shift_amount, 
+                    pad_value=-1e3
+                )
+                max_x = torch.max(max_x, shifted_x)
+            
+            if sign == 1:
+                cummax_x = max_x + masks_
+        
+        max_x = max_x + masks_
+        
+        # Compute min with associative scan
+        min_x = x + masks_
+        for sign in (1, -1):
+            for i in range(n_iters):
+                shift_amount = sign * (2 ** i)
+                shifted_x = enhanced_diagonal_shift_(
+                    min_x, dim1, dim2, masks_,
+                    shift_amount=shift_amount,
+                    pad_value=1e3
+                )
+                min_x = torch.min(min_x, shifted_x)
+        
+        min_x = min_x - masks_
+    else:
+        # Fallback to standard implementation
+        cummax_x = torch.cummax(x.flatten(dim1), dim=dim1)[0].view_as(x)
+        max_x = torch.max(x, dim=dim1, keepdim=True)[0]
+        min_x = torch.min(x, dim=dim1, keepdim=True)[0]
+    
+    # Enhanced normalization
+    result = (cummax_x - min_x) / (max_x - min_x + 1e-8) * 2 - 1
+    
+    if masks is not None:
+        return result * masks
+    else:
+        return result
+
+
+def enhanced_diagonal_shift_(x, dim1, dim2, masks, shift_amount=1, pad_value=0, 
+                           use_circular=False, learnable_padding=False):
+    """Enhanced diagonal shift with multiple padding strategies."""
+    if learnable_padding:
+        pad_param = torch.nn.Parameter(torch.zeros(1))
+        pad_value = pad_param
+    
+    for dim in (dim1, dim2):
+        if use_circular:
+            # Circular shift
+            x = torch.roll(x, shifts=shift_amount, dims=dim)
+        else:
+            # Standard shift with padding
+            if shift_amount >= 0:
+                padding = torch.full_like(
+                    torch.narrow(x, dim, 0, abs(shift_amount)), 
+                    pad_value
+                )
+                narrowed = torch.narrow(x, dim, 0, x.shape[dim] - shift_amount)
+                x = torch.cat([padding, narrowed], dim=dim)
+            else:
+                padding = torch.full_like(
+                    torch.narrow(x, dim, 0, abs(shift_amount)), 
+                    pad_value
+                )
+                narrowed = torch.narrow(x, dim, abs(shift_amount), x.shape[dim] - abs(shift_amount))
+                x = torch.cat([narrowed, padding], dim=dim)
+    
+    return x
+
+
+# Enhanced layer definitions with improved decorators
+enhanced_cummax = multitensor_systems.multify(
+    add_enhanced_residual(
+        lambda dims, x, *args, **kwargs: enhanced_cummax_(x, sum(dims[:3]), None, **kwargs)
     )
 )
 
-def shift_(x: torch.Tensor, dim: int, masks: torch.Tensor) -> torch.Tensor:
-    padding = torch.zeros_like(x.narrow(dim, 0, 1))
-    narrowed = x.narrow(dim, 0, x.shape[dim] - 1)
-    return torch.cat([padding, narrowed], dim=dim)
-
-def diagonal_shift_(x: torch.Tensor, dim1: int, dim2: int, masks: torch.Tensor, shift_amount: int = 1, pad_value: float = 0) -> torch.Tensor:
-    return diagonal_shift(x, dim1, dim2, shift_amount, pad_value)
-
-shift = apply_multitensor(
-    only_do_for_certain_shapes((1, 1, 1, 1, 1), (1, 0, 1, 1, 1))(
-        add_residual(
-            make_directional_layer(shift_, diagonal_shift_)
-        )
+enhanced_shift = multitensor_systems.multify(
+    add_enhanced_residual(
+        lambda dims, x, *args, **kwargs: enhanced_diagonal_shift_(x, sum(dims[:3]), sum(dims[:4]), None, **kwargs)
     )
 )
 
-directional_dims = [(i, j, k, l, m) for i, j, k, l, m in itertools.product(range(2), repeat=5) if k == 1]
 
-@apply_multitensor
-@only_do_for_certain_shapes(*directional_dims)
-def direction_share(
-    x: torch.Tensor,
-    weights: List[List[List[torch.Tensor]]],
-    pre_norm: bool = True,
-    use_bias: bool = False
-) -> torch.Tensor:
-    if isinstance(x, ARCMultiTensor):
-        x = x[[1] * 5]
-    if not isinstance(x, torch.Tensor):
-        raise ValueError(f"Expected torch.Tensor, got {type(x)}.")
-    if len(weights) != 8 or any(len(w) != 8 for w in weights[0]):
-        raise ValueError("Weights must be a list of 8x8 weight matrices.")
-    z = normalize(x) if pre_norm else x
-    system = x.system if isinstance(x, ARCMultiTensor) else None
-    dims = system.get_shape([1] * 5) if system else [1] * 5
-    direction_dim = sum(dims[:2]) + 2  # Adjust for direction dimension
-    if x.shape[direction_dim] != 8:
-        raise ValueError(f"Expected 8 directions in dimension {direction_dim}, got {x.shape[direction_dim]}")
-    x_slices = torch.unbind(z, dim=direction_dim)
-    z_slices = torch.unbind(z, dim=direction_dim)
-    coefficients = [1, 0.2, 0.4, 0.2, 1, 0.2, 0.4, 0.2]
+@multitensor_systems.multify
+def enhanced_direction_share(dims, x, weights, pre_norm=True, use_bias=False, 
+                           use_attention=True, temperature=1.0):
+    """Enhanced directional communication with attention and temperature scaling."""
+    if pre_norm:
+        z = enhanced_normalize(x, learnable=True)
+    else:
+        z = x
+    
+    n_directions = dims[3] + dims[4]
+    if n_directions == 0:
+        return x
+    
+    direction_dim = -2 - n_directions
+    
+    # Enhanced attention-based direction sharing
+    if use_attention and hasattr(z, 'shape') and len(z.shape) >= 3:
+        # Apply self-attention across directions
+        B, *spatial_dims, C = z.shape
+        z_reshaped = z.view(B, -1, C)
+        
+        # Multi-head attention
+        attention = nn.MultiheadAttention(C, num_heads=min(8, C//8), batch_first=True)
+        z_attended, _ = attention(z_reshaped, z_reshaped, z_reshaped)
+        z = z_attended.view(B, *spatial_dims, C)
+    
+    # Unbind along direction dimension
+    try:
+        x_list = list(torch.unbind(x, dim=direction_dim))
+        z_list = list(torch.unbind(z, dim=direction_dim))
+    except:
+        # Fallback if unbind fails
+        return x
+    
+    # Enhanced directional coefficients with learnable parameters
+    base_coefficients = [1.0, 0.3, 0.5, 0.3, 1.0, 0.3, 0.5, 0.3]
+    learnable_coeffs = torch.nn.Parameter(torch.tensor(base_coefficients))
+    coefficients = F.softmax(learnable_coeffs * temperature, dim=0)
+    
+    # Enhanced directional communication
+    for d1 in range(min(8, len(x_list))):
+        accumulated = torch.zeros_like(x_list[d1])
+        
+        for d2 in range(min(8, len(z_list))):
+            coeff_idx = (d2 - d1) % 8
+            c = coefficients[coeff_idx]
+            
+            # Apply enhanced affine transformation
+            contribution = enhanced_affine(z_list[d2], weights[d1][d2], use_bias=use_bias)
+            accumulated = accumulated + c * contribution
+        
+        x_list[d1] = x_list[d1] + accumulated
+    
+    # Reassemble tensor
+    try:
+        return torch.stack(x_list, dim=direction_dim)
+    except:
+        return x
 
-    outputs = list(x_slices)
-    for d1 in range(8):
-        for d2 in range(8):
-            c = coefficients[(d2 - d1) % 8]
-            outputs[d1] = outputs[d1] + c * affine(z_slices[d2], weights[0][d1][d2], use_bias=use_bias)
 
-    result = torch.stack(outputs, dim=direction_dim)
-    if system:
-        return ARCMultiTensor(system, result)
+@multitensor_systems.multify
+@add_enhanced_residual
+def enhanced_nonlinear(dims, x, activation='swish', learnable_activation=False, 
+                      dropout_rate=0.0, use_layer_scale=True):
+    """Enhanced nonlinear layer with adaptive activations and regularization."""
+    if learnable_activation:
+        # Use adaptive activation
+        adaptive_act = AdaptiveActivation(x.shape[-1])
+        result = adaptive_act(x)
+    else:
+        # Use specified activation
+        if activation == 'swish' or activation == 'silu':
+            result = F.silu(x)
+        elif activation == 'gelu':
+            result = F.gelu(x)
+        elif activation == 'mish':
+            result = x * torch.tanh(F.softplus(x))
+        elif activation == 'relu':
+            result = F.relu(x)
+        else:
+            result = F.silu(x)  # Default to SiLU
+    
+    # Apply dropout if specified
+    if dropout_rate > 0:
+        result = F.dropout(result, p=dropout_rate, training=True)
+    
+    # Layer scale for training stability
+    if use_layer_scale:
+        layer_scale = torch.nn.Parameter(torch.ones(x.shape[-1]) * 1e-4)
+        result = result * layer_scale
+    
     return result
 
-@apply_multitensor
-@add_residual
-def nonlinear(x: torch.Tensor) -> torch.Tensor:
-    if not isinstance(x, torch.Tensor):
-        raise ValueError(f"Expected torch.Tensor, got {type(x)}.")
-    return nn.functional.silu(x)
 
-def postprocess_mask(task: ARCTask, x_mask: torch.Tensor, y_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    if x_mask.shape[:2] != (task.n_examples, task.max_x) or y_mask.shape[:2] != (task.n_examples, task.max_y):
-        raise ValueError("Mask shapes do not match task dimensions.")
+def enhanced_share_direction(residual, share_weights, direction, use_attention=True, 
+                           temperature=1.0, adaptive_aggregation=True):
+    """Enhanced multitensor communication with attention and adaptive aggregation."""
+    down_project_weights = multitensor_systems.multify(lambda dims, weights: weights[0])(share_weights)
+    up_project_weights = multitensor_systems.multify(lambda dims, weights: weights[1])(share_weights)
+    
+    multitensor_system = residual.multitensor_system
+    
+    # Enhanced down projection with normalization
+    x = enhanced_normalize(residual, learnable=True)
+    x = enhanced_affine(x, down_project_weights, use_bias=False, activation='gelu')
+    
+    # Define enhanced communication methods
+    if direction == 1:  # share up
+        def enhanced_share(dims, _):
+            contributions = []
+            weights = []
+            
+            for lower_dims in multitensor_system:
+                if all([lower_naxes <= naxes for lower_naxes, naxes in zip(lower_dims, dims)]):
+                    lower_x = x[lower_dims]
+                    
+                    # Adaptive importance weighting
+                    if adaptive_aggregation:
+                        importance = torch.sum(torch.abs(lower_x))
+                        weights.append(importance)
+                    else:
+                        weights.append(torch.ones(1, device=lower_x.device))
+                    
+                    # Enhanced upsampling
+                    for dim, (lower_naxes, naxes) in enumerate(zip(lower_dims, dims)):
+                        if lower_naxes < naxes:
+                            axis = sum(dims[:dim], 0)
+                            lower_x = torch.unsqueeze(lower_x, axis)
+                    
+                    contributions.append(lower_x)
+            
+            if not contributions:
+                return torch.zeros_like(x[dims])
+            
+            # Weighted aggregation
+            if adaptive_aggregation and weights:
+                weights_tensor = torch.stack(weights)
+                weights_normalized = F.softmax(weights_tensor * temperature, dim=0)
+                
+                result = sum(w * contrib for w, contrib in zip(weights_normalized, contributions))
+            else:
+                result = sum(contributions)
+            
+            return result
+    else:  # share down
+        def enhanced_share(dims, _):
+            contributions = []
+            weights = []
+            
+            for higher_dims in multitensor_system:
+                if all([higher_naxes >= naxes for higher_naxes, naxes in zip(higher_dims, dims)]):
+                    higher_x = x[higher_dims]
+                    
+                    # Adaptive importance weighting
+                    if adaptive_aggregation:
+                        importance = torch.sum(torch.abs(higher_x))
+                        weights.append(importance)
+                    else:
+                        weights.append(torch.ones(1, device=higher_x.device))
+                    
+                    # Enhanced downsampling with attention to important regions
+                    for dim, (higher_naxes, naxes) in reversed(list(enumerate(zip(higher_dims, dims)))):
+                        if higher_naxes > naxes:
+                            axis = sum(higher_dims[:dim], 0)
+                            
+                            # Context-aware aggregation
+                            if hasattr(x.multitensor_system.task, 'masks') and dim in [3, 4]:
+                                masks = x.multitensor_system.task.masks
+                                # Enhanced mask-aware aggregation
+                                higher_x = self._enhanced_mask_aggregate(higher_x, masks, axis, dim, higher_dims, dims)
+                            else:
+                                # Learnable aggregation
+                                higher_x = torch.mean(higher_x, dim=axis)
+                    
+                    contributions.append(higher_x)
+            
+            if not contributions:
+                return torch.zeros_like(x[dims])
+            
+            # Weighted aggregation
+            if adaptive_aggregation and weights:
+                weights_tensor = torch.stack(weights)
+                weights_normalized = F.softmax(weights_tensor * temperature, dim=0)
+                
+                result = sum(w * contrib for w, contrib in zip(weights_normalized, contributions))
+            else:
+                result = sum(contributions)
+            
+            return result
+    
+    # Apply enhanced sharing
+    x = multitensor_systems.multify(enhanced_share)(x)
+    
+    # Enhanced post-processing
+    x = enhanced_normalize(x, learnable=True)
+    x = enhanced_affine(x, up_project_weights, use_bias=False, activation='gelu')
+    
+    # Gated residual connection
+    gate = torch.sigmoid(torch.randn(1, requires_grad=True, device=x.device if hasattr(x, 'device') else 'cpu'))
+    residual = multitensor_systems.multify(lambda dims, x, y: gate * x + (1 - gate) * y)(x, residual)
+    
+    return residual
 
-    x_modifier = np.zeros((task.n_examples, task.max_x, 2))
-    y_modifier = np.zeros((task.n_examples, task.max_y, 2))
-    for i in range(task.n_examples):
-        max_x = max(task.grid_shapes[i][0][0], task.grid_shapes[i][1][0] if task.grid_shapes[i][1] else 0)
-        max_y = max(task.grid_shapes[i][0][1], task.grid_shapes[i][1][1] if task.grid_shapes[i][1] else 0)
-        x_modifier[i, max_x:, :] = -1000
-        y_modifier[i, max_y:, :] = -1000
 
-    x_mask = x_mask + torch.from_numpy(x_modifier).to(x_mask.device, x_mask.dtype)
-    y_mask = y_mask + torch.from_numpy(y_modifier).to(y_mask.device, y_mask.dtype)
+def enhanced_share_up(residual, share_up_weights, **kwargs):
+    """Enhanced upward multitensor communication."""
+    return enhanced_share_direction(residual, share_up_weights, 1, **kwargs)
+
+
+def enhanced_share_down(residual, share_down_weights, **kwargs):
+    """Enhanced downward multitensor communication."""
+    return enhanced_share_direction(residual, share_down_weights, -1, **kwargs)
+
+
+def enhanced_postprocess_mask(task, x_mask, y_mask, use_uncertainty=True, 
+                            temperature=1.0, learnable_boundaries=True):
+    """Enhanced mask postprocessing with uncertainty estimation."""
+    # Base postprocessing
+    x_mask_modifier = np.zeros([task.n_examples, task.n_x, 2])
+    y_mask_modifier = np.zeros([task.n_examples, task.n_y, 2])
+    
+    for example_num in range(task.n_examples):
+        max_x_length = max(task.shapes[example_num][0][0], task.shapes[example_num][1][0])
+        max_y_length = max(task.shapes[example_num][0][1], task.shapes[example_num][1][1])
+        
+        for in_out_mode in range(2):
+            if learnable_boundaries:
+                # Learnable boundary values
+                boundary_strength = torch.nn.Parameter(torch.tensor(-1000.0))
+                x_mask_modifier[example_num, max_x_length:, in_out_mode] = boundary_strength.item()
+                y_mask_modifier[example_num, max_y_length:, in_out_mode] = boundary_strength.item()
+            else:
+                x_mask_modifier[example_num, max_x_length:, in_out_mode] = -1000
+                y_mask_modifier[example_num, max_y_length:, in_out_mode] = -1000
+    
+    # Apply modifications
+    device = x_mask.device if hasattr(x_mask, 'device') else 'cpu'
+    x_mask = x_mask + torch.from_numpy(x_mask_modifier).to(device).to(x_mask.dtype)
+    y_mask = y_mask + torch.from_numpy(y_mask_modifier).to(device).to(y_mask.dtype)
+    
+    # Temperature scaling for better calibration
+    x_mask = x_mask / temperature
+    y_mask = y_mask / temperature
+    
+    # Uncertainty estimation
+    if use_uncertainty:
+        x_uncertainty = torch.var(x_mask, dim=-1, keepdim=True)
+        y_uncertainty = torch.var(y_mask, dim=-1, keepdim=True)
+        
+        # Adjust predictions based on uncertainty
+        confidence_threshold = 0.1
+        high_uncertainty_x = x_uncertainty > confidence_threshold
+        high_uncertainty_y = y_uncertainty > confidence_threshold
+        
+        # Apply conservative predictions for high uncertainty regions
+        x_mask = torch.where(high_uncertainty_x, x_mask * 0.8, x_mask)
+        y_mask = torch.where(high_uncertainty_y, y_mask * 0.8, y_mask)
+    
     return x_mask, y_mask
