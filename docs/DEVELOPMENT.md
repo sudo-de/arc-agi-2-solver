@@ -1,3 +1,6 @@
+# Development Guide
+
+Welcome to the ARC-AGI-2 Solver development guide! This document provides a comprehensive overview of the development workflow, project structure, and best practices for contributing to this project.
 
 ## Getting Started
 
