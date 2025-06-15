@@ -4,7 +4,8 @@
 [![pytest](https://github.com/sudo-de/arc-agi-2-solver/actions/workflows/pytest.yml/badge.svg)](https://github.com/sudo-de/arc-agi-2-solver/actions)
 
 ## Overview
-This project implements a sophisticated neural network model designed to solve ARC-AGI tasks. The model uses a Variational Autoencoder (VAE) decoder architecture with custom layers designed for spatial reasoning and pattern recognition.
+Welcome to the ARC-AGI-2 Solver! This project implements a sophisticated neural network model designed to solve the Abstraction and Reasoning Challenge (ARC-AGI-2). Our model leverages a Variational Autoencoder (VAE) decoder architecture with custom layers tailored for spatial reasoning and pattern recognition, making it a powerful tool for tackling complex ARC tasks.
+
 - **[Abstraction and Reasoning Challenge (ARC-AGI-2)](https://www.kaggle.com/competitions/arc-prize-2025)**
 
 ## Key Features
@@ -36,7 +37,6 @@ This project implements a sophisticated neural network model designed to solve A
 - **Directional Layers**: Cumulative maximum and shift operations
 - **Direction Share**: Directional communication layer
 - **Nonlinear Layer**: SiLU activation with residual connections
-
 
 ## Installation
 
