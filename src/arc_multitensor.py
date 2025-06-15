@@ -1,106 +1,174 @@
-from typing import List, Optional, Any, Union, Callable
 import numpy as np
 import torch
+import inspect
 
-# Set seeds for reproducibility
+
 np.random.seed(0)
 torch.manual_seed(0)
 
-class ARCMultiTensorSystem:
-    """Manages multi-dimensional configurations for ARC-AGI tasks, handling examples, colors, directions, and (x, y) positions."""
-    NUM_DIMENSIONS: int = 5  # Fixed dimensions: examples, colors, directions, x, y
 
-    def __init__(self, n_examples: int, n_colors: int, n_x: int, n_y: int, task: Any):
-        if any(dim <= 0 for dim in [n_examples, n_colors, n_x, n_y]):
-            raise ValueError("All dimensions (n_examples, n_colors, n_x, n_y) must be positive.")
-        if task is None:
-            raise ValueError("Task cannot be None.")
+NUM_DIMENSIONS = 5  # We have 5 dimensions: examples, colors, directions, x, y
 
+class MultiTensorSystem:
+    """Mock MultiTensorSystem for testing purposes."""
+    def __init__(self, n_examples, n_colors, n_x, n_y, task):
         self.n_examples = n_examples
         self.n_colors = n_colors
-        self.n_directions = 8  # Fixed number of directions
+        self.n_directions = 8
         self.n_x = n_x
         self.n_y = n_y
         self.task = task
-        self.dim_lengths = [self.n_examples, self.n_colors, self.n_directions, self.n_x, self.n_y]
-
-    def is_valid_combination(self, dims: List[int]) -> bool:
-        if len(dims) != self.NUM_DIMENSIONS:
-            raise ValueError(f"Expected {self.NUM_DIMENSIONS} dimensions, got {len(dims)}.")
-        if (dims[3] or dims[4]) and not dims[0]:  # x or y requires examples
+        self.dim_lengths = [self.n_examples, self.n_colors,
+                            self.n_directions, self.n_x, self.n_y]
+    
+    def dims_valid(self, dims):
+        # If x or y is set, then examples must also be set.
+        if (dims[3] or dims[4]) and not dims[0]:
             return False
-        if sum(dims[1:]) == 0:  # At least one of colors, directions, x, y needed
+        # At least one of [color, direction, x, y] must be set.
+        if sum(dims[1:]) == 0:
             return False
         return True
 
-    def get_shape(self, dims: List[int], extra_dim: Optional[int] = None) -> List[int]:
-        shape = [length for i, length in enumerate(self.dim_lengths) if dims[i]]
+    def shape(self, dims, extra_dim=None):
+        shape = []
+        for dim_index, length in enumerate(self.dim_lengths):
+            if dims[dim_index]:
+                shape.append(length)
         if extra_dim is not None:
             shape.append(extra_dim)
         return shape
 
-    def _generate_combinations(self):
-        for i in range(1 << self.NUM_DIMENSIONS):
-            dims = [(i >> bit) & 1 for bit in range(self.NUM_DIMENSIONS)]
-            if self.is_valid_combination(dims):
-                yield dims
+    def _generate_dims_combinations(self):
+        """Generate all possible 5-bit dimension combinations (from 0..31)."""
+        for i in range(2 ** NUM_DIMENSIONS):
+            dims = [(i >> bit) & 1 for bit in range(NUM_DIMENSIONS)]
+            yield dims
 
     def __iter__(self):
-        return self._generate_combinations()
+        for dims in self._generate_dims_combinations():
+            if self.dims_valid(dims):
+                yield dims
 
-    def create_multitensor(self, default: Any = None) -> 'ARCMultiTensor':
-        def build_nested(depth: int) -> Union[List, Any]:
-            if depth == self.NUM_DIMENSIONS:
-                return default
-            return [build_nested(depth + 1) for _ in range(2)]
-        return ARCMultiTensor(build_nested(0), self)
+    def _make_multitensor(self, default, index):
+        """
+        Helper method to create a nested tensor structure.
+        Args:
+            default (Any): The default value to fill the tensor with.
+            index (int): The current depth in the tensor structure.
+        Returns:
+            Any: The nested tensor structure.
+        """
+        if index == NUM_DIMENSIONS:
+            return default
+        return [self._make_multitensor(default, index+1) for _ in range(2)]
 
-class ARCMultiTensor:
-    def __init__(self, data: List, system: ARCMultiTensorSystem):
+    def make_multitensor(self, default=None):
+        return MultiTensor(self._make_multitensor(default, 0), self)
+
+
+class MultiTensor:
+    """
+    Wrapper for a nested data structure that can be indexed by a 5-element dims array.
+    """
+
+    def __init__(self, data, multitensor_system):
+        """
+        Args:
+            data (nested list): The nested list holding the actual data.
+            multitensor_system (MultiTensorSystem): The system this MultiTensor belongs to.
+        """
         self.data = data
-        self.system = system
+        self.multitensor_system = multitensor_system
 
-    def __getitem__(self, dims: List[int]) -> Any:
-        if len(dims) != self.system.NUM_DIMENSIONS:
-            raise ValueError(f"Expected {self.system.NUM_DIMENSIONS} dimensions, got {len(dims)}.")
-        node = self.data
-        for dim in dims:
-            node = node[dim]
-        return node
+    def __getitem__(self, dims):
+        """
+        Retrieve the data at a specific 5-dimensional index.
+        Args:
+            dims (list[int]): 5-element array (0 or 1) indicating path in nested lists.
+        Returns:
+            Any: The data stored at that nested location.
+        """
+        d = self.data
+        for dim_val in dims:
+            d = d[dim_val]
+        return d
 
-    def __setitem__(self, dims: List[int], value: Any) -> None:
-        if len(dims) != self.system.NUM_DIMENSIONS:
-            raise ValueError(f"Expected {self.NUM_DIMENSIONS} dimensions, got {len(dims)}.")
-        node = self.data
-        for dim in dims[:-1]:
-            node = node[dim]
-        node[dims[-1]] = value
+    def __setitem__(self, dims, value):
+        """
+        Set the data at a specific 5-dimensional index.
+        Args:
+            dims (list[int]): 5-element array (0 or 1) indicating path in nested lists.
+            value (Any): The value to store.
+        """
+        d = self.data
+        for dim_val in dims[:-1]:
+            d = d[dim_val]
+        d[dims[-1]] = value
 
-def apply_multitensor(fn: Callable) -> Callable:
-    def wrapper(*args, **kwargs) -> Any:
+
+def multify(fn):
+    """
+    Decorator that applies a function to all valid dimension combinations
+    if any arguments are MultiTensor instances.
+    """
+
+    def wrapper(*args, **kwargs):
+        # Check if we should perform multi-mode or not
         multitensor_system = None
-        is_multi_mode = False
-        # Check args for ARCMultiTensor
+        multi_mode = False
+
+        # Identify if any arg or kwarg is a MultiTensor
         for arg in args:
-            if isinstance(arg, ARCMultiTensor):
-                is_multi_mode = True
-                multitensor_system = arg.system
-                break
-        # Check kwargs for ARCMultiTensor
-        if not is_multi_mode:
+            if isinstance(arg, MultiTensor):
+                multi_mode = True
+                multitensor_system = arg.multitensor_system
+        if not multi_mode:
             for value in kwargs.values():
-                if isinstance(value, ARCMultiTensor):
-                    is_multi_mode = True
-                    multitensor_system = value.system
+                if isinstance(value, MultiTensor):
+                    multi_mode = True
+                    multitensor_system = value.multitensor_system
                     break
-        # Non-multi mode: call function directly
-        if not is_multi_mode:
+
+        # If none of the args/kwargs are MultiTensor, just call the function directly
+        if not multi_mode:
             return fn(*args, **kwargs)
-        # Multi mode: apply function for each dimension combination
-        result = multitensor_system.create_multitensor()
-        for dims in multitensor_system:
-            new_args = [arg[dims] if isinstance(arg, ARCMultiTensor) else arg for arg in args]
-            new_kwargs = {k: v[dims] if isinstance(v, ARCMultiTensor) else v for k, v in kwargs.items()}
-            result[dims] = fn(*new_args, **new_kwargs)
-        return result
+
+        # We do have MultiTensor arguments, so let's build a new MultiTensor result
+        # of the same shape and fill it by iterating over valid dimension combos.
+        def iterate_and_assign(multitensor_system, result_data):
+            """Helper to iterate over dims and assign function outputs."""
+
+            for dims in multitensor_system:
+                # Build per-dims argument list
+                new_args = []
+                for arg in args:
+                    if isinstance(arg, MultiTensor):
+                        new_args.append(arg[dims])
+                    else:
+                        new_args.append(arg)
+                # Build per-dims kwargs
+                new_kwargs = {}
+                for key, value in kwargs.items():
+                    if isinstance(value, MultiTensor):
+                        new_kwargs[key] = value[dims]
+                    else:
+                        new_kwargs[key] = value
+                # Call the user function on these "scalar" values
+                output = fn(dims, *new_args, **new_kwargs)
+                # Assign back to the result MultiTensor
+                # This goes step by step into result_data
+                result_data[dims] = output
+
+        # Create an empty nested list structure
+        result_data = multitensor_system.make_multitensor()
+        iterate_and_assign(multitensor_system, result_data)
+
+        # Return a MultiTensor wrapping the nested result
+        return result_data
+
     return wrapper
+
+
+class multitensor_systems:
+    multify = staticmethod(multify)

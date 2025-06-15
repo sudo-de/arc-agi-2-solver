@@ -1,0 +1,5 @@
+2025-06-15 19:28:55,417 - submission_generator - ERROR - ✗ Submission format validation failed with 1 errors
+2025-06-15 19:28:55,417 - submission_generator - ERROR -   Task task_001[0]: missing 'attempt_1' or 'attempt_2'
+2025-06-15 19:33:08,263 - submission_generator - INFO - ✓ Submission format validation passed
+2025-06-15 19:34:27,430 - submission_generator - INFO - ✓ Submission format validation passed
+2025-06-15 19:36:49,063 - submission_generator - INFO - ✓ Submission format validation passed

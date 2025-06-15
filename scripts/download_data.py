@@ -1,84 +1,54 @@
 import os
 import json
-import urllib.request
-import zipfile
-from pathlib import Path
 import argparse
+import sys
+from pathlib import Path
+from typing import Optional
 
-def download_file(url: str, filepath: str) -> None:
-    """Download file from URL to filepath."""
-    print(f"Downloading {url} to {filepath}")
-    urllib.request.urlretrieve(url, filepath)
-    print(f"Downloaded {filepath}")
 
-def setup_data_directory(data_dir: str = "data") -> None:
-    """Setup data directory structure."""
+def setup_data_directory(data_dir: str = "data") -> Path:
+    """Create and setup data directory structure"""
     data_path = Path(data_dir)
-    
-    # Create directories
-    (data_path / "raw").mkdir(parents=True, exist_ok=True)
-    (data_path / "processed").mkdir(parents=True, exist_ok=True)
-    
-    print(f"Created data directory structure at {data_path.absolute()}")
+    data_path.mkdir(exist_ok=True)
+    print(f"📁 Data directory: {data_path.absolute()}")
+    return data_path
 
-def download_arc_data(data_dir: str = "data") -> None:
-    """Download ARC-AGI dataset files."""
-    
-    # Note: These URLs are placeholders - replace with actual ARC-AGI URLs
-    base_url = "https://github.com/fchollet/ARC/raw/master/data"
-    
-    files_to_download = [
-        "training_challenges.json",
-        "training_solutions.json", 
-        "evaluation_challenges.json",
-        "evaluation_solutions.json",
-        "test_challenges.json"
+
+def organize_existing_files(source_dir: str, data_dir: Path) -> bool:
+    """Organize existing ARC files from a source directory"""
+    source_path = Path(source_dir)
+    if not source_path.exists():
+        print(f"✗ Source directory {source_dir} does not exist")
+        return False
+    # Expected filenames
+    expected_files = [
+        "arc-agi_training_challenges.json",
+        "arc-agi_training_solutions.json", 
+        "arc-agi_evaluation_challenges.json",
+        "arc-agi_evaluation_solutions.json",
+        "arc-agi_test_challenges.json"
     ]
-    
-    data_path = Path(data_dir) / "raw"
-    
-    for filename in files_to_download:
-        url = f"{base_url}/{filename}"
-        filepath = data_path / f"arc-agi_{filename}"
-        
-        try:
-            download_file(url, str(filepath))
-        except Exception as e:
-            print(f"Failed to download {filename}: {e}")
-            # Create placeholder files for development
-            create_placeholder_file(filepath, filename)
+    found_files = 0
+    for filename in expected_files:
+        source_file = source_path / filename
+        target_file = data_dir / filename
+        if source_file.exists():
+            try:
+                import shutil
+                shutil.copy2(source_file, target_file)
+                print(f"✓ Copied {filename}")
+                found_files += 1
+            except Exception as e:
+                print(f"✗ Failed to copy {filename}: {e}")
+        else:
+            print(f"⚠ File not found: {filename}")
+    print(f"\n📊 Organized {found_files}/{len(expected_files)} files")
+    return found_files > 0
 
-def create_placeholder_file(filepath: Path, filename: str) -> None:
-    """Create placeholder data files for development."""
-    print(f"Creating placeholder file: {filepath}")
-    
-    # Create minimal valid ARC task data
-    if "challenges" in filename:
-        placeholder_data = {
-            "placeholder_task": {
-                "train": [
-                    {
-                        "input": [[0, 1], [1, 0]],
-                        "output": [[1, 0], [0, 1]]
-                    }
-                ],
-                "test": [
-                    {"input": [[0, 0], [1, 1]]}
-                ]
-            }
-        }
-    else:  # solutions file
-        placeholder_data = {
-            "placeholder_task": [[[1, 1], [0, 0]]]
-        }
-    
-    with open(filepath, 'w') as f:
-        json.dump(placeholder_data, f, indent=2)
 
-def verify_data(data_dir: str = "data") -> bool:
-    """Verify that all required data files exist and are valid."""
-    data_path = Path(data_dir) / "raw"
-    
+def validate_data_files(data_dir: Path) -> bool:
+    """Validate that downloaded data files are correct"""
+    print("\n🔍 Validating data files...")
     required_files = [
         "arc-agi_training_challenges.json",
         "arc-agi_training_solutions.json",
@@ -86,47 +56,72 @@ def verify_data(data_dir: str = "data") -> bool:
         "arc-agi_evaluation_solutions.json",
         "arc-agi_test_challenges.json"
     ]
-    
-    all_exist = True
+    validation_results = {}
     for filename in required_files:
-        filepath = data_path / filename
-        if not filepath.exists():
-            print(f"Missing file: {filepath}")
-            all_exist = False
-        else:
-            # Verify JSON is valid
+        filepath = data_dir / filename
+        validation_results[filename] = {
+            'exists': filepath.exists(),
+            'size': filepath.stat().st_size if filepath.exists() else 0,
+            'valid_json': False,
+            'task_count': 0
+        }
+        if filepath.exists():
             try:
                 with open(filepath, 'r') as f:
                     data = json.load(f)
-                print(f"✓ {filename}: {len(data)} tasks")
-            except json.JSONDecodeError as e:
-                print(f"✗ {filename}: Invalid JSON - {e}")
-                all_exist = False
-    
-    return all_exist
+                validation_results[filename]['valid_json'] = True
+                validation_results[filename]['task_count'] = len(data)
+                print(f"✓ {filename}: {len(data)} tasks, {filepath.stat().st_size / 1024:.1f} KB")
+            except json.JSONDecodeError:
+                print(f"✗ {filename}: Invalid JSON format")
+            except Exception as e:
+                print(f"✗ {filename}: Error reading file - {e}")
+        else:
+            print(f"✗ {filename}: File not found")
+    # Check if we have minimum required files
+    essential_files = [
+        "arc-agi_training_challenges.json",
+        "arc-agi_test_challenges.json"
+    ]
+    has_essential = all(
+        validation_results[f]['exists'] and validation_results[f]['valid_json'] 
+        for f in essential_files
+    )
+    if has_essential:
+        print("✓ Essential data files validated successfully")
+        print("\n📊 Dataset Summary:")
+        for filename, results in validation_results.items():
+            if results['valid_json']:
+                split_name = filename.split('_')[1]  # training/evaluation/test
+                file_type = 'solutions' if 'solutions' in filename else 'challenges'
+                print(f"  {split_name.title()} {file_type}: {results['task_count']} tasks")
+        return True
+    else:
+        print("✗ Essential data files missing or invalid")
+        return False
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Download ARC-AGI dataset")
-    parser.add_argument("--data-dir", default="data", help="Data directory path")
-    parser.add_argument("--verify-only", action="store_true", help="Only verify existing data")
-    
+    """Main execution function"""
+    parser = argparse.ArgumentParser(description="Organize and validate ARC-AGI data files")
+    parser.add_argument('--data-dir', default='data', help='Data directory path (default: data)')
+    parser.add_argument('--source-dir', default='data/raw', help='Source directory for organize method')
     args = parser.parse_args()
-    
-    if args.verify_only:
-        if verify_data(args.data_dir):
-            print("All data files are present and valid")
-        else:
-            print("Some data files are missing or invalid")
-        return
-    
-    print("Setting up ARC-AGI dataset...")
-    setup_data_directory(args.data_dir)
-    download_arc_data(args.data_dir)
-    
-    if verify_data(args.data_dir):
-        print("Dataset setup completed successfully!")
+    print("🎯 ARC-AGI Data Organize/Validate Script")
+    print("=" * 40)
+    # Setup data directory
+    data_dir = setup_data_directory(args.data_dir)
+    # Organize files from source_dir
+    organize_existing_files(args.source_dir, data_dir)
+    # Validate files
+    validation_success = validate_data_files(data_dir)
+    if validation_success:
+        print("\n🎉 Data organization and validation completed successfully!")
+        print(f"Data location: {data_dir.absolute()}")
     else:
-        print("Dataset setup completed with some issues.")
+        print("\n✗ Data organization/validation failed")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
