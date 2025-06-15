@@ -13,6 +13,6 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          name: Release ${{ github.ref_name }}
-          body: ${{ github.event.head_commit.message }}
+          name: Release v1.0.1
+          body: Add CodeQL analysis workflow
           token: ${{ secrets.RELEASE_TOKEN }} 
