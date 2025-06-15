@@ -16,7 +16,7 @@ We are committed to ensuring the security of our project. The following versions
 We take security vulnerabilities seriously. If you discover a vulnerability, please follow these steps:
 
 1. **Do not disclose the vulnerability publicly**.
-2. **Email us** at [security@example.com](mailto:security@example.com) with the following information:
+2. **Email us** at [sudo.sde@gmail.com](mailto:sudo.sde@gmail.com) with the following information:
    - Description of the vulnerability
    - Steps to reproduce
    - Potential impact
